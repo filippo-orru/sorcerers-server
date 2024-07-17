@@ -1,7 +1,8 @@
 name: sorcerers_server
 description: A server app using the shelf package and Docker.
 version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+repository: https://github.com/filippo-orru/sorcerers-server
+publish_to: none
 
 environment:
   sdk: ^3.4.3
@@ -11,6 +12,9 @@ dependencies:
   shelf: ^1.4.0
   shelf_router: ^1.1.0
   shelf_web_socket: ^2.0.0
+  web_socket_channel: ^3.0.0
+  sorcerers_core:
+    path: ./packages/core
 
 dev_dependencies:
   http: ^1.1.0
