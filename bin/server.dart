@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:shelf/shelf.dart';
@@ -27,16 +28,14 @@ class ClientConnection {
   String? name;
 
   ClientConnection(this.id, this.channel) {
-    channel.stream.listen(onMessage, onDone: () {
-      clients.remove(id);
-    });
+    channel.stream.listen(onMessage, onDone: onDone);
     print('Connected new client $id. Currently ${clients.length} clients connected.');
   }
 
   void onMessage(dynamic message) {
     final ClientMessage clientMessage;
     try {
-      clientMessage = ClientMessage.fromJson(message);
+      clientMessage = ClientMessage.fromJson(jsonDecode(message));
     } on Exception catch (e) {
       print('Error parsing message: $e');
       return;
@@ -108,7 +107,7 @@ class ClientConnection {
   }
 
   void send(ServerMessage message) {
-    channel.sink.add(message.toJson());
+    channel.sink.add(jsonEncode(message.toJson()));
   }
 
   void sendUpdate() {
@@ -117,6 +116,22 @@ class ClientConnection {
 
   void close() {
     channel.sink.close();
+  }
+
+  void onDone() {
+    switch (state) {
+      case ServerLobbyStateInLobby(lobby: final lobby):
+      case ServerLobbyStateInGame(lobby: final lobby):
+        lobby.leave(this);
+        break;
+      default:
+        break;
+    }
+
+    close();
+    clients.remove(id);
+
+    print('Disconnected client $id. Currently ${clients.length} clients connected.');
   }
 }
 
@@ -131,28 +146,37 @@ class ServerLobby {
 
   int get size => players.length;
 
-  void add(ClientConnection player) {
-    players.add(ServerPlayerInLobby(player));
-    print('Player "${player.id}" joined lobby "$lobbyName"');
+  void add(ClientConnection connection) {
+    players.add(ServerPlayerInLobby(connection));
+    print('Player "${connection.id}" joined lobby "$lobbyName"');
+    notifyAll();
   }
 
   void leave(ClientConnection clientConnection) {
-    players.removeWhere((p) => p.client == clientConnection);
+    players.removeWhere((p) => p.connection == clientConnection);
     print('Player "${clientConnection.id}" left lobby "$lobbyName"');
+    notifyAll();
   }
 
   void readyToPlay(ClientConnection clientConnection, {required bool ready}) {
-    final player = players.firstWhere((p) => p.client == clientConnection);
+    final player = players.firstWhere((p) => p.connection == clientConnection);
     player.ready = ready;
     print('Player "${clientConnection.id}" is ready to play in lobby "$lobbyName"');
+    notifyAll();
+  }
+
+  void notifyAll() {
+    for (final player in players) {
+      player.connection.sendUpdate();
+    }
   }
 }
 
 class ServerPlayerInLobby {
-  final ClientConnection client;
+  final ClientConnection connection;
   bool ready = false;
 
-  ServerPlayerInLobby(this.client);
+  ServerPlayerInLobby(this.connection);
 }
 
 sealed class ServerLobbyState {
@@ -167,7 +191,7 @@ sealed class ServerLobbyState {
       case ServerLobbyStateInLobby(lobby: final lobby):
         return LobbyStateInLobby(
           lobby.lobbyName,
-          lobby.players.map((p) => PlayerInLobby(p.client.name!, p.ready)).toList(),
+          lobby.players.map((p) => PlayerInLobby(p.connection.name!, p.ready)).toList(),
         );
       case ServerLobbyStateInGame(game: final game):
         return LobbyStatePlaying(game.toState((_) {}));
