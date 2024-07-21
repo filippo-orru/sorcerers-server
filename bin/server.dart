@@ -8,6 +8,10 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:sorcerers_core/game/game.dart';
 import 'package:sorcerers_core/online/messages/messages_client.dart';
 import 'package:sorcerers_core/online/messages/messages_server.dart';
+import 'package:sorcerers_core/utils.dart';
+import 'package:uuid/data.dart';
+import 'package:uuid/rng.dart';
+import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/adapter_web_socket_channel.dart';
 
 typedef LobbyName = String;
@@ -19,17 +23,24 @@ final clients = <ConnectionId, ClientConnection>{};
 
 int uniqueCounter = 0;
 
+void notifyAll() {
+  for (final connection in clients.values) {
+    connection.playerAdapter?.sendUpdate();
+  }
+}
+
 class ClientConnection {
   final ConnectionId id;
   final AdapterWebSocketChannel channel;
 
-  ServerLobbyState? state;
+  PlayerAdapter? playerAdapter;
 
   ClientConnection(this.id, this.channel) {
     channel.stream.listen(onMessage, onDone: onDone);
     print('Connected new client $id. Currently ${clients.length} clients connected.');
-    sendUpdate();
   }
+
+  final cryptoRNG = CryptoRNG();
 
   void onMessage(dynamic message) {
     final ClientMessage clientMessage;
@@ -40,24 +51,100 @@ class ClientConnection {
       return;
     }
 
+    final adapter = playerAdapter;
+    if (adapter == null) {
+      switch (clientMessage) {
+        case Hello(reconnectId: final reconnectId):
+          if (reconnectId == null) {
+            createNewPlayerAdapter();
+          } else {
+            final existingConnection = clients.values.map<ClientConnection?>((c) => c).firstWhere(
+                (c) => c?.playerAdapter?.reconnectId == reconnectId,
+                orElse: () => null);
+            if (existingConnection != null) {
+              playerAdapter = existingConnection.playerAdapter;
+              existingConnection.playerAdapter = null;
+              existingConnection.close();
+            } else {
+              createNewPlayerAdapter();
+            }
+          }
+          sendHelloResponse();
+        default:
+          print("Must say hello first");
+      }
+    } else {
+      try {
+        adapter.onMessage(clientMessage);
+      } on Exception catch (e) {
+        print('Error handling message: $e');
+        return;
+      }
+    }
+  }
+
+  void createNewPlayerAdapter() {
+    playerAdapter = PlayerAdapter(
+      playerId: Uuid().v4(),
+      reconnectId: Uuid().v4(config: V4Options(null, cryptoRNG)),
+      connection: this,
+    );
+  }
+
+  void sendHelloResponse() {
+    send(HelloResponse(playerId: playerAdapter!.playerId, reconnectId: playerAdapter!.reconnectId));
+  }
+
+  void send(ServerMessage message) {
+    channel.sink.add(jsonEncode(message.toJson()));
+  }
+
+  void close() {
+    channel.sink.close();
+  }
+
+  void onDone() {
+    playerAdapter?.onDone();
+    close();
+    clients.remove(id);
+
+    print('Disconnected client $id. Currently ${clients.length} clients connected.');
+  }
+}
+
+class PlayerAdapter {
+  final PlayerId playerId;
+  final ReconnectId reconnectId; // Secret
+
+  ClientConnection connection;
+  String? name;
+  ServerLobbyState? state;
+
+  PlayerAdapter({
+    required this.playerId,
+    required this.reconnectId,
+    required this.connection,
+  });
+
+  void onMessage(ClientMessage clientMessage) {
     switch (state) {
       case null:
         if (clientMessage is SetName) {
-          state = ServerLobbyStateIdle(clientMessage.playerName);
+          state = ServerLobbyStateIdle();
           print('Set name: ${clientMessage.playerName}');
         } else {
           print('Must set name first');
           return;
         }
 
-      case ServerLobbyStateIdle(name: final name):
+      case ServerLobbyStateIdle():
         switch (clientMessage) {
           case CreateLobby(lobbyName: final lobbyName):
             if (lobbies[lobbyName] == null) {
               final lobby = ServerLobby(lobbyName, this);
               lobbies[lobbyName] = lobby;
 
-              state = ServerLobbyStateInLobby(name, lobby);
+              state = ServerLobbyStateInLobby(lobby);
             } else {
               print('Lobby "$lobbyName" already exists');
             }
@@ -66,7 +153,7 @@ class ClientConnection {
             final lobby = lobbies[lobbyName];
             if (lobby != null) {
               lobby.add(this);
-              state = ServerLobbyStateInLobby(name, lobby);
+              state = ServerLobbyStateInLobby(lobby);
             } else {
               print('Lobby "$lobbyName" does not exist');
             }
@@ -75,11 +162,11 @@ class ClientConnection {
             print('Invalid message for Idle state: $clientMessage');
             break;
         }
-      case ServerLobbyStateInLobby(name: final name, lobby: final lobby):
+      case ServerLobbyStateInLobby(lobby: final lobby):
         switch (clientMessage) {
           case LeaveLobby():
             lobby.leave(this);
-            state = ServerLobbyStateIdle(name);
+            state = ServerLobbyStateIdle();
             break;
           case ReadyToPlay(ready: final ready):
             lobby.readyToPlay(this, ready: ready);
@@ -87,14 +174,14 @@ class ClientConnection {
             print('Invalid message for InLobby state: $clientMessage');
             break;
         }
-      case ServerLobbyStateInGame(name: final name, lobby: final lobby, game: final game):
+      case ServerLobbyStateInGame(lobby: final lobby, game: final game):
         switch (clientMessage) {
           case GameMessage(gameMessage: final gameMessage):
             game.onMessage(gameMessage);
             break;
           case LeaveLobby():
             lobby.leave(this);
-            state = ServerLobbyStateIdle(name);
+            state = ServerLobbyStateIdle();
             break;
           default:
             print('Invalid message for InGame state: $clientMessage');
@@ -105,16 +192,11 @@ class ClientConnection {
     sendUpdate();
   }
 
-  void send(ServerMessage message) {
-    channel.sink.add(jsonEncode(message.toJson()));
-  }
-
   void sendUpdate() {
-    send(StateUpdate(state?.toClient(this)));
-  }
-
-  void close() {
-    channel.sink.close();
+    if (name == null) {
+      return;
+    }
+    connection.send(StateUpdate(state?.toClient(name!)));
   }
 
   void onDone() {
@@ -126,60 +208,64 @@ class ClientConnection {
       default:
         break;
     }
-
-    close();
-    clients.remove(id);
-
-    print('Disconnected client $id. Currently ${clients.length} clients connected.');
   }
 }
 
 class ServerLobby {
   final LobbyName lobbyName;
-  final List<ServerPlayerInLobby> players = [];
+  final Map<PlayerId, ServerPlayerInLobby> players = {};
 
-  ServerLobby(this.lobbyName, ClientConnection creator) {
+  ServerLobby(this.lobbyName, PlayerAdapter creator) {
     print('Lobby created "$lobbyName"');
     add(creator);
   }
 
   int get size => players.length;
 
-  void add(ClientConnection connection) {
-    players.add(ServerPlayerInLobby(connection));
-    print('Player "${connection.id}" joined lobby "$lobbyName"');
+  void add(PlayerAdapter player) {
+    players[player.playerId] = ServerPlayerInLobby(player);
+    print('Player "${player.playerId}" joined lobby "$lobbyName"');
     notifyAll();
   }
 
-  void leave(ClientConnection clientConnection) {
-    players.removeWhere((p) => p.connection == clientConnection);
-    print('Player "${clientConnection.id}" left lobby "$lobbyName"');
-    notifyAll();
-  }
-
-  void readyToPlay(ClientConnection clientConnection, {required bool ready}) {
-    final player = players.firstWhere((p) => p.connection == clientConnection);
-    player.ready = ready;
-    print('Player "${clientConnection.id}": ready to play in lobby "$lobbyName": $ready');
-    notifyAll();
-  }
-
-  void notifyAll() {
-    for (final player in players) {
-      player.connection.sendUpdate();
+  void leave(PlayerAdapter player) {
+    players.remove(player.playerId);
+    print('Player "${player.playerId}" left lobby "$lobbyName"');
+    if (players.isEmpty) {
+      close();
     }
+
+    notifyAll();
+  }
+
+  void readyToPlay(PlayerAdapter player, {required bool ready}) {
+    final playerInLobby = players[player.playerId]!;
+    playerInLobby.ready = ready;
+    print('Player "${player.playerId}": ready to play in lobby "$lobbyName": $ready');
+    notifyAllInLobby();
+  }
+
+  void notifyAllInLobby() {
+    for (final playerInLobby in players.values) {
+      playerInLobby.player.sendUpdate();
+    }
+  }
+
+  void close() {
+    print('Closing lobby "$lobbyName"');
+    lobbies.remove(lobbyName);
   }
 }
 
 class ServerPlayerInLobby {
-  final ClientConnection connection;
+  final PlayerAdapter player;
   bool ready = false;
 
-  ServerPlayerInLobby(this.connection);
+  ServerPlayerInLobby(this.player);
 }
 
 sealed class ServerLobbyState {
-  LobbyState toClient(ClientConnection client) {
+  LobbyState toClient(String name) {
     switch (this) {
       case ServerLobbyStateIdle():
         return LobbyStateIdle(lobbies.entries.map((entry) {
@@ -187,13 +273,12 @@ sealed class ServerLobbyState {
           final lobby = entry.value;
           return LobbyData(lobbyName, lobby.size);
         }).toList());
-      case ServerLobbyStateInLobby(name: final name, lobby: final lobby):
+      case ServerLobbyStateInLobby(lobby: final lobby):
         return LobbyStateInLobby(
-          name,
           lobby.lobbyName,
-          lobby.players.map((p) => PlayerInLobby(name, p.ready)).toList(),
+          lobby.players.values.map((p) => PlayerInLobby(name, p.ready)).toList(),
         );
-      case ServerLobbyStateInGame(name: final name, game: final game):
+      case ServerLobbyStateInGame(game: final game):
         return LobbyStatePlaying(
           name,
           game.toState((_) {}),
@@ -203,25 +288,20 @@ sealed class ServerLobbyState {
 }
 
 class ServerLobbyStateIdle extends ServerLobbyState {
-  final String name;
-
-  ServerLobbyStateIdle(this.name);
+  ServerLobbyStateIdle();
 }
 
 class ServerLobbyStateInLobby extends ServerLobbyState {
-  final String name;
   final ServerLobby lobby;
 
-  ServerLobbyStateInLobby(this.name, this.lobby);
+  ServerLobbyStateInLobby(this.lobby);
 }
 
 class ServerLobbyStateInGame extends ServerLobbyState {
-  final String name;
   final ServerLobby lobby;
   final Game game;
 
-  ServerLobbyStateInGame(this.name, List<String> playerNames, this.lobby)
-      : game = Game(playerNames);
+  ServerLobbyStateInGame(List<String> playerNames, this.lobby) : game = Game(playerNames);
 }
 
 final websocketHandler = webSocketHandler((webSocket) {

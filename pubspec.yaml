@@ -13,6 +13,7 @@ dependencies:
   shelf_router: ^1.1.0
   shelf_web_socket: ^2.0.0
   web_socket_channel: ^3.0.0
+  uuid: ^4.4.2
   sorcerers_core:
     path: ./packages/core
 
