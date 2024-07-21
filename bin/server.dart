@@ -6,6 +6,7 @@ import 'package:shelf/shelf_io.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:sorcerers_core/game/game.dart';
+import 'package:sorcerers_core/online/messages/game_messages_client.dart';
 import 'package:sorcerers_core/online/messages/messages_client.dart';
 import 'package:sorcerers_core/online/messages/messages_server.dart';
 import 'package:sorcerers_core/utils.dart';
@@ -18,7 +19,8 @@ typedef LobbyName = String;
 typedef ConnectionId = int;
 const minPlayers = 2; // TODO 3
 
-final lobbies = <LobbyName, ServerLobby>{};
+final openLobbies = <LobbyName, ServerLobby>{};
+final playingLobbies = <ServerLobby>[];
 
 final clients = <ConnectionId, ClientConnection>{};
 
@@ -134,10 +136,6 @@ class PlayerAdapter {
 
   void onMessage(ClientMessage clientMessage) {
     bool updated = false;
-    void notifyAllInternal() {
-      notifyAll();
-      updated = true;
-    }
 
     final lobby = this.lobby;
     if (lobby == null) {
@@ -147,18 +145,19 @@ class PlayerAdapter {
           print('Set name: ${clientMessage.playerName}');
 
         case CreateLobby(lobbyName: final lobbyName):
-          if (lobbies[lobbyName] == null) {
+          if (openLobbies[lobbyName] == null) {
             final lobby = ServerLobby(lobbyName, this);
-            lobbies[lobbyName] = lobby;
+            openLobbies[lobbyName] = lobby;
 
             this.lobby = lobby;
-            notifyAllInternal();
+            notifyAll();
+            updated = true;
           } else {
             print('Lobby "$lobbyName" already exists');
           }
           break;
         case JoinLobby(lobbyName: final lobbyName):
-          final lobby = lobbies[lobbyName];
+          final lobby = openLobbies[lobbyName];
           if (lobby != null) {
             lobby.add(this);
             this.lobby = lobby;
@@ -178,6 +177,8 @@ class PlayerAdapter {
           break;
         default:
           lobby.onMessage(this, clientMessage);
+          lobby.notifyAllInLobby();
+          updated = true;
           break;
       }
     }
@@ -203,10 +204,7 @@ class PlayerAdapter {
 }
 
 List<LobbyData> getAllOpenLobbies() {
-  return lobbies.values
-      .where((l) => l.state is ServerLobbyStateInLobby)
-      .map((lobby) => LobbyData(lobby.lobbyName, lobby.size))
-      .toList();
+  return openLobbies.values.map((lobby) => LobbyData(lobby.lobbyName, lobby.size)).toList();
 }
 
 class ServerLobby {
@@ -245,10 +243,16 @@ class ServerLobby {
     print('Player "${player.playerId}": ready to play in lobby "$lobbyName": $ready');
 
     if (players.length >= minPlayers && players.values.every((p) => p.ready)) {
-      state = ServerLobbyStateInGame(players.values);
+      startToPlay();
     }
 
     notifyAllInLobby();
+  }
+
+  void startToPlay() {
+    openLobbies.remove(lobbyName);
+    playingLobbies.add(this);
+    state = ServerLobbyStateInGame(players.values);
   }
 
   void notifyAllInLobby() {
@@ -259,7 +263,10 @@ class ServerLobby {
 
   void close() {
     print('Closing lobby "$lobbyName"');
-    lobbies.remove(lobbyName);
+
+    openLobbies.remove(lobbyName);
+    playingLobbies.remove(this);
+
     for (final playerInLobby in players.values) {
       playerInLobby.player.lobby = null;
     }
@@ -274,7 +281,14 @@ class ServerLobby {
           case ServerLobbyStateInLobby():
             print("Error: Received GameMessage, but lobby is not playing yet");
           case ServerLobbyStateInGame(game: final game):
-            game.onMessage(fromPlayerId: clientMessage.playerId, message: gameMessage);
+            if (gameMessage is LeaveGame) {
+              state = ServerLobbyStateInLobby(
+                message: "Player ${playerAdapter.name ?? "unnamed"} has left",
+              );
+              leave(playerAdapter);
+            } else {
+              game.onMessage(fromPlayerId: clientMessage.playerId, message: gameMessage);
+            }
         }
         break;
       default:
@@ -285,17 +299,17 @@ class ServerLobby {
 
   LobbyState getClientState({required PlayerAdapter forPlayer}) {
     switch (state) {
-      case ServerLobbyStateInLobby():
+      case ServerLobbyStateInLobby(message: final message):
         return LobbyStateInLobby(
-          lobbyName,
-          players.values
-              .map((p) => PlayerInLobby(
-                    p.player.playerId,
-                    p.player.name!,
-                    p.ready,
-                  ))
-              .toList(),
-        );
+            lobbyName,
+            players.values
+                .map((p) => PlayerInLobby(
+                      p.player.playerId,
+                      p.player.name!,
+                      p.ready,
+                    ))
+                .toList(),
+            message);
       case ServerLobbyStateInGame(game: final game):
         return LobbyStatePlaying(game.toState(forPlayer.playerId));
     }
@@ -312,7 +326,9 @@ class ServerPlayerInLobby {
 sealed class ServerLobbyState {}
 
 class ServerLobbyStateInLobby extends ServerLobbyState {
-  ServerLobbyStateInLobby();
+  String? message;
+
+  ServerLobbyStateInLobby({this.message});
 }
 
 class ServerLobbyStateInGame extends ServerLobbyState {
