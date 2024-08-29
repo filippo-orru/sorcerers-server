@@ -17,7 +17,6 @@ import 'package:web_socket_channel/adapter_web_socket_channel.dart';
 
 typedef LobbyName = String;
 typedef ConnectionId = int;
-const minPlayers = 2; // TODO 3
 
 final openLobbies = <LobbyName, ServerLobby>{};
 final playingLobbies = <ServerLobby>[];
@@ -229,6 +228,8 @@ class ServerLobby {
 
   void leave(PlayerAdapter player) {
     players.remove(player.playerId);
+    player.lobby = null;
+
     print('Player "${player.playerId}" left lobby "$lobbyName"');
     if (players.isEmpty) {
       close();
@@ -242,7 +243,7 @@ class ServerLobby {
     playerInLobby.ready = ready;
     print('Player "${player.playerId}": ready to play in lobby "$lobbyName": $ready');
 
-    if (players.length >= minPlayers && players.values.every((p) => p.ready)) {
+    if (players.length >= lobbyMinNumberOfPlayers && players.values.every((p) => p.ready)) {
       startToPlay();
     }
 
